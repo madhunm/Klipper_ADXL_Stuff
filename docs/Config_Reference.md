@@ -1377,7 +1377,12 @@ accelerometer measurements from the sensor. This enables an
 ACCELEROMETER_MEASURE command (see
 [G-Codes](G-Codes.md#adxl345-accelerometer-commands) for more
 information). The default chip name is "default", but one may specify
-an explicit name (eg, [adxl345 my_chip_name]).
+an explicit name (eg, [adxl345 my_chip_name]). Note that if `probe_pin`
+parameter is set, this enables Z-probe functionality of ADXL345, which
+enables additional parameters. This also enables `probe:z_virtual_endstop`
+pin which can be used as a Z axis endstop on the printers with the
+appropriate kinematics.
+
 
 ```
 [adxl345]
@@ -1405,6 +1410,36 @@ cs_pin:
 #   not recommended to change this rate from the default 3200, and
 #   rates below 800 will considerably affect the quality of resonance
 #   measurements.
+#probe_pin:
+#   Pin on the printer MCU that the accelerometer is connected to as a
+#   Z probe. Setting this pin enables the functionality of ADXL345
+#   working as a Z probe. All parameters below are enabled only if
+#   probe_pin is set. Disabled by default.
+#int_pin:
+#   Either int1 or int2; the pin on the ADXL345 that will be connected
+#   to the probe pin on the printer MCU. By default, int_pin is high when
+#   probe is triggered and low otherwise; this behavior can be changed
+#   by using `!int1` or `!int2` respectively, in which case the int_pin
+#   is low when triggered and high otherwise. If probe_pin is set, this
+#   parameter must be provided.
+#tap_thresh: 5000
+#   Acceleration threshold in mm/sec^2; when the accelerometer exceeds
+#   this acceleration during probing for at most tap_dur seconds (see
+#   below), it will consider that it hit the printer bed, triggering
+#   the probe. The default is 5000 mm/sec^2, which may be too sensitive
+#   for many printers.
+#tap_dur: 0.01
+#   The maximum duration of a 'tap' during probing. If the acceleration
+#   exceeds tap_thresh for at most tap_dur during probing, this will
+#   trigger the probe endstop. The default is 0.01 sec.
+#z_offset:
+#speed:
+#samples:
+#sample_retract_dist:
+#samples_result:
+#samples_tolerance:
+#samples_tolerance_retries:
+#   See the "probe" section for information on these parameters.
 ```
 
 ## [resonance_tester]

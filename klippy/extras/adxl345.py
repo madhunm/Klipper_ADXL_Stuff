@@ -4,7 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging, time, collections, multiprocessing, os
-from . import bus
+from . import bus, probe
 
 # ADXL345 registers
 REG_DEVID = 0x00
@@ -14,6 +14,15 @@ REG_DATA_FORMAT = 0x31
 REG_FIFO_CTL = 0x38
 REG_MOD_READ = 0x80
 REG_MOD_MULTI = 0x40
+REG_THRESH_TAP = 0x1D
+REG_DUR = 0x21
+REG_INT_MAP = 0x2F
+REG_TAP_AXES = 0x2A
+REG_OFSX = 0x1E
+REG_OFSY = 0x1F
+REG_OFSZ = 0x20
+REG_INT_ENABLE = 0x2E
+REG_INT_SOURCE = 0x30
 
 QUERY_RATES = {
     25: 0x8, 50: 0x9, 100: 0xa, 200: 0xb, 400: 0xc,
@@ -21,6 +30,8 @@ QUERY_RATES = {
 }
 
 SCALE = 0.004 * 9.80665 * 1000. # 4mg/LSB * Earth gravity in mm/s**2
+DUR_SCALE = 0.000625 # 0.625 msec / LSB
+TAP_SCALE = 0.0625 * 9.80665 * 1000. # 62.5/LSB * Earth gravity in mm/s**2
 
 Accel_Measurement = collections.namedtuple(
     'Accel_Measurement', ('time', 'accel_x', 'accel_y', 'accel_z'))
@@ -93,7 +104,97 @@ class ADXL345Results:
         write_proc.daemon = True
         write_proc.start()
 
-# Printer class that controls measurments
+# ADXL345 virtual endstop wrapper for probing
+class ADXL345EndstopWrapper:
+    def __init__(self, config, adxl345, axes_map):
+        self.printer = config.get_printer()
+        self.printer.register_event_handler("klippy:connect", self.connect)
+        self.adxl345 = adxl345
+        self.axes_map = axes_map
+        int_pin = config.get('int_pin').strip()
+        self.inverted = False
+        if int_pin.startswith('!'):
+            self.inverted = True
+            int_pin = int_pin[1:].strip()
+        if int_pin != 'int1' and int_pin != 'int2':
+            raise config.error('int_pin must specify one of int1 or int2 pins')
+        self.int_map = 0x40 if int_pin == 'int2' else 0x0
+        probe_pin = config.get('probe_pin')
+        self.position_endstop = config.getfloat('z_offset')
+        self.tap_thresh = config.getfloat('tap_thresh', 5000,
+                                          minval=TAP_SCALE, maxval=100000.)
+        self.tap_dur = config.getfloat('tap_dur', 0.01,
+                                       above=DUR_SCALE, maxval=0.1)
+        self.next_cmd_time = self.action_end_time = 0.
+        # Create an "endstop" object to handle the sensor pin
+        ppins = self.printer.lookup_object('pins')
+        pin_params = ppins.lookup_pin(probe_pin, can_invert=True,
+                                      can_pullup=True)
+        mcu = pin_params['chip']
+        mcu.register_config_callback(self._build_config)
+        self.mcu_endstop = mcu.setup_pin('endstop', pin_params)
+        # Wrappers
+        self.get_mcu = self.mcu_endstop.get_mcu
+        self.add_stepper = self.mcu_endstop.add_stepper
+        self.get_steppers = self.mcu_endstop.get_steppers
+        self.home_start = self.mcu_endstop.home_start
+        self.home_wait = self.mcu_endstop.home_wait
+        self.query_endstop = self.mcu_endstop.query_endstop
+    def _build_config(self):
+        kin = self.printer.lookup_object('toolhead').get_kinematics()
+        for stepper in kin.get_steppers():
+            if stepper.is_active_axis('z'):
+                self.add_stepper(stepper)
+    def connect(self):
+        self.adxl345.set_reg(REG_POWER_CTL, 0x00)
+        if self.inverted:
+            self.adxl345.set_reg(REG_DATA_FORMAT, 0x2B)
+        self.adxl345.set_reg(REG_INT_MAP, self.int_map)
+        self.adxl345.set_reg(REG_TAP_AXES, 0x7)
+        self.adxl345.set_reg(REG_THRESH_TAP, int(self.tap_thresh / TAP_SCALE))
+        self.adxl345.set_reg(REG_DUR, int(self.tap_dur / DUR_SCALE))
+        # Offset freefall accleration on the true Z axis
+        z_axis, z_scale = self.axes_map[2]
+        z_reg = (REG_OFSX, REG_OFSY, REG_OFSZ)[z_axis]
+        # 0x40 is g acceleration, and 0xc0 is its twos complement
+        ofs_val = 0x40 if z_scale < 0 else 0xc0
+        self.adxl345.set_reg(z_reg, ofs_val)
+    def multi_probe_begin(self):
+        pass
+    def multi_probe_end(self):
+        pass
+    def _try_clear_tap(self):
+        tries = 8
+        while tries > 0:
+            val = self.adxl345.read_reg(REG_INT_SOURCE)
+            if not (val & 0x40):
+                return True
+            tries -= 1
+        return False
+    def probe_prepare(self):
+        toolhead = self.printer.lookup_object('toolhead')
+        print_time = toolhead.get_last_move_time()
+        toolhead.flush_step_generation()
+        clock = self.adxl345.get_mcu().print_time_to_clock(print_time)
+        self.adxl345.read_reg(REG_INT_SOURCE)
+        self.adxl345.set_reg(REG_INT_ENABLE, 0x40, minclock=clock)
+        if not self.adxl345.is_measuring():
+            self.adxl345.set_reg(REG_POWER_CTL, 0x08)
+        if not self._try_clear_tap():
+            raise self.printer.command_error(
+                    "ADXL345 tap triggered before move, too sensitive?")
+    def probe_finish(self):
+        toolhead = self.printer.lookup_object('toolhead')
+        print_time = toolhead.get_last_move_time()
+        clock = self.adxl345.get_mcu().print_time_to_clock(print_time)
+        self.adxl345.set_reg(REG_INT_ENABLE, 0x00, minclock=clock)
+        if not self.adxl345.is_measuring():
+            self.adxl345.set_reg(REG_POWER_CTL, 0x00)
+        if not self._try_clear_tap():
+            raise self.printer.command_error(
+                    "ADXL345 tap triggered after move, too sensitive?")
+
+# Printer class that controls ADXL345 chip
 class ADXL345:
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -135,11 +236,39 @@ class ADXL345:
         gcode.register_mux_command("ACCELEROMETER_QUERY", "CHIP", name,
                                    self.cmd_ACCELEROMETER_QUERY,
                                    desc=self.cmd_ACCELEROMETER_QUERY_help)
+        gcode.register_mux_command("READ_ADXL345", "CHIP", name,
+                                   self.cmd_READ_ADXL345,
+                                   desc=self.cmd_READ_ADXL345_help)
+        gcode.register_mux_command("SET_ADXL345", "CHIP", name,
+                                   self.cmd_SET_ADXL345,
+                                   desc=self.cmd_SET_ADXL345_help)
         if name == "default":
             gcode.register_mux_command("ACCELEROMETER_MEASURE", "CHIP", None,
                                        self.cmd_ACCELEROMETER_MEASURE)
             gcode.register_mux_command("ACCELEROMETER_QUERY", "CHIP", None,
                                        self.cmd_ACCELEROMETER_QUERY)
+            gcode.register_mux_command("READ_ADXL345", "CHIP", None,
+                                       self.cmd_READ_ADXL345,
+                                       desc=self.cmd_READ_ADXL345_help)
+            gcode.register_mux_command("SET_ADXL345", "CHIP", None,
+                                       self.cmd_SET_ADXL345,
+                                       desc=self.cmd_SET_ADXL345_help)
+        self.printer.register_event_handler("klippy:connect", self.connect)
+        if config.get('probe_pin', None) is not None:
+            adxl345_endstop = ADXL345EndstopWrapper(config, self, self.axes_map)
+            self.printer.add_object('probe',
+                                    probe.PrinterProbe(config, adxl345_endstop))
+    def connect(self):
+        # Setup ADXL345 parameters and verify chip connectivity
+        self.set_reg(REG_POWER_CTL, 0x00)
+        dev_id = self.read_reg(REG_DEVID)
+        if dev_id != 0xe5:
+            raise self.printer.config_error("Invalid adxl345 id (got %x vs %x)"
+                                            % (dev_id, 0xe5))
+        self.set_reg(REG_INT_ENABLE, 0x00)
+        self.set_reg(REG_DATA_FORMAT, 0x0B)
+    def get_mcu(self):
+        return self.spi.get_mcu()
     def _build_config(self):
         self.query_adxl345_cmd = self.mcu.lookup_command(
             "query_adxl345 oid=%c clock=%u rest_ticks=%u",
@@ -170,23 +299,31 @@ class ADXL345:
         if sequence < self.last_sequence:
             sequence += 0x10000
         return sequence
+    def read_reg(self, reg):
+        params = self.spi.spi_transfer([reg | REG_MOD_READ, 0x00])
+        response = bytearray(params['response'])
+        return response[1]
+    def set_reg(self, reg, val, minclock=0):
+        self.spi.spi_send([reg, val], minclock=minclock)
+        stored_val = self.read_reg(reg)
+        if stored_val != val:
+            raise self.printer.command_error(
+                    "Failed to set ADXL345 register [0x%x] to 0x%x: got 0x%x. "
+                    "This is generally indicative of connection problems "
+                    "(e.g. faulty wiring) or a faulty adxl345 chip." % (
+                        reg, val, stored_val))
+    def is_measuring(self):
+        return self.query_rate > 0
     def start_measurements(self, rate=None):
         rate = rate or self.data_rate
-        # Verify chip connectivity
-        params = self.spi.spi_transfer([REG_DEVID | REG_MOD_READ, 0x00])
-        response = bytearray(params['response'])
-        if response[1] != 0xe5:
-            raise self.printer.command_error("Invalid adxl345 id (got %x vs %x)"
-                                             % (response[1], 0xe5))
         # Setup chip in requested query rate
         clock = 0
         if self.last_tx_time:
             clock = self.mcu.print_time_to_clock(self.last_tx_time)
-        self.spi.spi_send([REG_POWER_CTL, 0x00], minclock=clock)
-        self.spi.spi_send([REG_FIFO_CTL, 0x00])
-        self.spi.spi_send([REG_DATA_FORMAT, 0x0B])
-        self.spi.spi_send([REG_BW_RATE, QUERY_RATES[rate]])
-        self.spi.spi_send([REG_FIFO_CTL, 0x80])
+        self.set_reg(REG_POWER_CTL, 0x00, minclock=clock)
+        self.set_reg(REG_FIFO_CTL, 0x00)
+        self.set_reg(REG_BW_RATE, QUERY_RATES[rate])
+        self.set_reg(REG_FIFO_CTL, 0x80)
         # Setup samples
         print_time = self.printer.lookup_object('toolhead').get_last_move_time()
         self.raw_samples = []
@@ -200,8 +337,7 @@ class ADXL345:
         self.query_adxl345_cmd.send([self.oid, reqclock, rest_ticks],
                                     reqclock=reqclock)
     def finish_measurements(self):
-        query_rate = self.query_rate
-        if not query_rate:
+        if not self.is_measuring():
             return ADXL345Results()
         # Halt bulk reading
         print_time = self.printer.lookup_object('toolhead').get_last_move_time()
@@ -224,20 +360,22 @@ class ADXL345:
         logging.info("ADXL345 finished %d measurements: %s",
                      res.total_count, res.get_stats())
         return res
-    def end_query(self, name):
-        if not self.query_rate:
+    def end_query(self, name, gcmd):
+        if not self.is_measuring():
             return
         res = self.finish_measurements()
         # Write data to file
         filename = "/tmp/adxl345-%s.csv" % (name,)
         res.write_to_file(filename)
+        gcmd.respond_info(
+                "Writing raw accelerometer data to %s file" % (filename,))
     cmd_ACCELEROMETER_MEASURE_help = "Start/stop accelerometer"
     def cmd_ACCELEROMETER_MEASURE(self, gcmd):
-        if self.query_rate:
+        if self.is_measuring():
             name = gcmd.get("NAME", time.strftime("%Y%m%d_%H%M%S"))
             if not name.replace('-', '').replace('_', '').isalnum():
                 raise gcmd.error("Invalid adxl345 NAME parameter")
-            self.end_query(name)
+            self.end_query(name, gcmd)
             gcmd.respond_info("adxl345 measurements stopped")
         else:
             rate = gcmd.get_int("RATE", self.data_rate)
@@ -247,7 +385,7 @@ class ADXL345:
             gcmd.respond_info("adxl345 measurements started")
     cmd_ACCELEROMETER_QUERY_help = "Query accelerometer for the current values"
     def cmd_ACCELEROMETER_QUERY(self, gcmd):
-        if self.query_rate:
+        if self.is_measuring():
             raise gcmd.error("adxl345 measurements in progress")
         self.start_measurements()
         reactor = self.printer.get_reactor()
@@ -263,6 +401,21 @@ class ADXL345:
         _, accel_x, accel_y, accel_z = values[-1]
         gcmd.respond_info("adxl345 values (x, y, z): %.6f, %.6f, %.6f" % (
             accel_x, accel_y, accel_z))
+    cmd_READ_ADXL345_help = "Query accelerometer register"
+    def cmd_READ_ADXL345(self, gcmd):
+        if self.is_measuring():
+            raise gcmd.error("adxl345 measurements in progress")
+        reg = gcmd.get("REG", minval=29, maxval=57, parser=lambda x: int(x, 0))
+        val = self.read_reg(reg)
+        gcmd.respond_info("ADXL345 REG[0x%x] = 0x%x" % (reg, val))
+
+    cmd_SET_ADXL345_help = "Set accelerometer register"
+    def cmd_SET_ADXL345(self, gcmd):
+        if self.is_measuring():
+            raise gcmd.error("adxl345 measurements in progress")
+        reg = gcmd.get("REG", minval=29, maxval=57, parser=lambda x: int(x, 0))
+        val = gcmd.get("VAL", minval=0, maxval=255, parser=lambda x: int(x, 0))
+        self.set_reg(reg, val)
 
 def load_config(config):
     return ADXL345(config)
