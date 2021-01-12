@@ -122,7 +122,7 @@ class PrinterProbe:
                                      probe_pos=True, verify_movement=verify)
         except self.printer.command_error as e:
             reason = str(e)
-            if "Timeout during endstop homing" in reason:
+            if "Timeout during homing" in reason:
                 reason += HINT_TIMEOUT
             raise self.printer.command_error(reason)
         pos = toolhead.get_position()
