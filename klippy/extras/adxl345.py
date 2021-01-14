@@ -3,7 +3,7 @@
 # Copyright (C) 2020  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import logging, time, collections, multiprocessing, os
+import logging, math, time, collections, multiprocessing, os
 from . import bus, probe
 
 # ADXL345 registers
@@ -29,9 +29,13 @@ QUERY_RATES = {
     800: 0xd, 1600: 0xe, 3200: 0xf,
 }
 
-SCALE = 0.004 * 9.80665 * 1000. # 4mg/LSB * Earth gravity in mm/s**2
+FREEFALL_ACCEL = 9.80665 * 1000.
+SCALE = 0.0039 * FREEFALL_ACCEL # 3.9mg/LSB * Earth gravity in mm/s**2
 DUR_SCALE = 0.000625 # 0.625 msec / LSB
-TAP_SCALE = 0.0625 * 9.80665 * 1000. # 62.5/LSB * Earth gravity in mm/s**2
+TAP_SCALE = 0.0625 * FREEFALL_ACCEL # 62.5mg/LSB * Earth gravity in mm/s**2
+OFS_SCALE = 0.0156 * FREEFALL_ACCEL # 15.6mg/LSB * Earth gravity in mm/s**2
+
+PROBE_CALIBRATION_TIME = 1.
 
 Accel_Measurement = collections.namedtuple(
     'Accel_Measurement', ('time', 'accel_x', 'accel_y', 'accel_z'))
@@ -108,9 +112,11 @@ class ADXL345Results:
 class ADXL345EndstopWrapper:
     def __init__(self, config, adxl345, axes_map):
         self.printer = config.get_printer()
-        self.printer.register_event_handler("klippy:connect", self.connect)
+        self.printer.register_event_handler("klippy:connect", self.calibrate)
+        self.calibrated = False
         self.adxl345 = adxl345
         self.axes_map = axes_map
+        self.ofs_regs = (REG_OFSX, REG_OFSY, REG_OFSZ)
         int_pin = config.get('int_pin').strip()
         self.inverted = False
         if int_pin.startswith('!'):
@@ -140,59 +146,121 @@ class ADXL345EndstopWrapper:
         self.home_start = self.mcu_endstop.home_start
         self.home_wait = self.mcu_endstop.home_wait
         self.query_endstop = self.mcu_endstop.query_endstop
+        # Register commands
+        gcode = self.printer.lookup_object('gcode')
+        gcode.register_mux_command(
+                "ACCEL_PROBE_CALIBRATE", "CHIP", None,
+                self.cmd_ACCELPROBE_CALIBRATE,
+                desc=self.cmd_ACCELPROBE_CALIBRATE_help)
     def _build_config(self):
         kin = self.printer.lookup_object('toolhead').get_kinematics()
         for stepper in kin.get_steppers():
             if stepper.is_active_axis('z'):
                 self.add_stepper(stepper)
-    def connect(self):
-        self.adxl345.set_reg(REG_POWER_CTL, 0x00)
+    def calibrate(self, gcmd=None, retries=3):
+        adxl345 = self.adxl345
+        if not adxl345.is_initialized():
+            # ADXL345 that works as a probe must be initialized from the start
+            adxl345.initialize()
+        adxl345.set_reg(REG_POWER_CTL, 0x00)
         if self.inverted:
-            self.adxl345.set_reg(REG_DATA_FORMAT, 0x2B)
-        self.adxl345.set_reg(REG_INT_MAP, self.int_map)
-        self.adxl345.set_reg(REG_TAP_AXES, 0x7)
-        self.adxl345.set_reg(REG_THRESH_TAP, int(self.tap_thresh / TAP_SCALE))
-        self.adxl345.set_reg(REG_DUR, int(self.tap_dur / DUR_SCALE))
+            adxl345.set_reg(REG_DATA_FORMAT, 0x2B)
+        adxl345.set_reg(REG_INT_MAP, self.int_map)
+        adxl345.set_reg(REG_TAP_AXES, 0x7)
+        adxl345.set_reg(REG_THRESH_TAP, int(self.tap_thresh / TAP_SCALE))
+        adxl345.set_reg(REG_DUR, int(self.tap_dur / DUR_SCALE))
         # Offset freefall accleration on the true Z axis
-        z_axis, z_scale = self.axes_map[2]
-        z_reg = (REG_OFSX, REG_OFSY, REG_OFSZ)[z_axis]
-        # 0x40 is g acceleration, and 0xc0 is its twos complement
-        ofs_val = 0x40 if z_scale < 0 else 0xc0
-        self.adxl345.set_reg(z_reg, ofs_val)
+        for reg in self.ofs_regs:
+            adxl345.set_reg(reg, 0x00)
+        adxl345.start_measurements()
+        reactor = self.printer.get_reactor()
+        reactor.register_callback(lambda ev: self._offset_axes(gcmd, retries),
+                                  reactor.monotonic() + PROBE_CALIBRATION_TIME)
+    def _offset_axes(self, gcmd, retries):
+        res = self.adxl345.finish_measurements()
+        msg_func = gcmd.respond_info if gcmd is not None else logging.info
+        samples = res.decode_samples()
+        x_ofs = sum([s.accel_x for s in samples]) / len(samples)
+        y_ofs = sum([s.accel_y for s in samples]) / len(samples)
+        z_ofs = sum([s.accel_z for s in samples]) / len(samples)
+        meas_freefall_accel = math.sqrt(x_ofs**2 + y_ofs**2 + z_ofs**2)
+        if abs(meas_freefall_accel - FREEFALL_ACCEL) > FREEFALL_ACCEL * 0.5:
+            err_msg = ("Calibration error: ADXL345 incorrectly measures "
+                       "freefall accleration: %.0f (measured) vs %.0f "
+                       "(expected)" % (meas_freefall_accel, FREEFALL_ACCEL))
+            if retries > 0:
+                msg_func(err_msg + ", retrying (%d)" % (retries-1,))
+                self.calibrate(gcmd, retries-1)
+            else:
+                msg_func(err_msg + ", aborting self-calibration")
+            return
+        x_m = max([abs(s.accel_x - x_ofs) for s in samples])
+        y_m = max([abs(s.accel_y - y_ofs) for s in samples])
+        z_m = max([abs(s.accel_z - z_ofs) for s in samples])
+        accel_noise = max(x_m, y_m, z_m)
+        if accel_noise > self.tap_thresh:
+            err_msg = ("Calibration error: ADXL345 noise level too high for "
+                       "the configured tap_thresh: %.0f (tap_thresh) vs "
+                       "%.0f (noise)" % (self.tap_thresh, accel_noise))
+            if retries > 0:
+                msg_func(err_msg + ", retrying (%d)" % (retries-1,))
+                self.calibrate(gcmd, retries-1)
+            else:
+                msg_func(err_msg + ", aborting self-calibration")
+            return
+        for ofs, axis in zip((x_ofs, y_ofs, z_ofs), (0, 1, 2)):
+            ofs_reg = self.ofs_regs[self.axes_map[axis][0]]
+            ofs_val = 0xFF & int(round(
+                -ofs / self.axes_map[axis][1] * (SCALE / OFS_SCALE)))
+            self.adxl345.set_reg(ofs_reg, ofs_val)
+        msg_func("Successfully calibrated ADXL345")
+        self.calibrated = True
     def multi_probe_begin(self):
         pass
     def multi_probe_end(self):
         pass
     def _try_clear_tap(self):
+        adxl345 = self.adxl345
         tries = 8
         while tries > 0:
-            val = self.adxl345.read_reg(REG_INT_SOURCE)
+            val = adxl345.read_reg(REG_INT_SOURCE)
             if not (val & 0x40):
                 return True
             tries -= 1
         return False
     def probe_prepare(self):
+        if not self.calibrated:
+            raise self.printer.command_error(
+                    "ADXL345 probe failed calibration, "
+                    "retry with ACCEL_PROBE_CALIBRATE command")
+        adxl345 = self.adxl345
         toolhead = self.printer.lookup_object('toolhead')
         print_time = toolhead.get_last_move_time()
         toolhead.flush_step_generation()
         clock = self.adxl345.get_mcu().print_time_to_clock(print_time)
-        self.adxl345.read_reg(REG_INT_SOURCE)
-        self.adxl345.set_reg(REG_INT_ENABLE, 0x40, minclock=clock)
-        if not self.adxl345.is_measuring():
-            self.adxl345.set_reg(REG_POWER_CTL, 0x08)
+        if not adxl345.is_initialized():
+            adxl345.initialize()
+        adxl345.read_reg(REG_INT_SOURCE)
+        adxl345.set_reg(REG_INT_ENABLE, 0x40, minclock=clock)
+        if not adxl345.is_measuring():
+            adxl345.set_reg(REG_POWER_CTL, 0x08)
         if not self._try_clear_tap():
             raise self.printer.command_error(
                     "ADXL345 tap triggered before move, too sensitive?")
     def probe_finish(self):
+        adxl345 = self.adxl345
         toolhead = self.printer.lookup_object('toolhead')
         print_time = toolhead.get_last_move_time()
-        clock = self.adxl345.get_mcu().print_time_to_clock(print_time)
-        self.adxl345.set_reg(REG_INT_ENABLE, 0x00, minclock=clock)
-        if not self.adxl345.is_measuring():
-            self.adxl345.set_reg(REG_POWER_CTL, 0x00)
+        clock = adxl345.get_mcu().print_time_to_clock(print_time)
+        adxl345.set_reg(REG_INT_ENABLE, 0x00, minclock=clock)
+        if not adxl345.is_measuring():
+            adxl345.set_reg(REG_POWER_CTL, 0x00)
         if not self._try_clear_tap():
             raise self.printer.command_error(
                     "ADXL345 tap triggered after move, too sensitive?")
+    cmd_ACCELPROBE_CALIBRATE_help = "Force ADXL345 probe [re-]calibration"
+    def cmd_ACCELPROBE_CALIBRATE(self, gcmd):
+        self.calibrate(gcmd)
 
 # Printer class that controls ADXL345 chip
 class ADXL345:
@@ -253,18 +321,19 @@ class ADXL345:
             gcode.register_mux_command("SET_ADXL345", "CHIP", None,
                                        self.cmd_SET_ADXL345,
                                        desc=self.cmd_SET_ADXL345_help)
-        self.printer.register_event_handler("klippy:connect", self.connect)
         if config.get('probe_pin', None) is not None:
             adxl345_endstop = ADXL345EndstopWrapper(config, self, self.axes_map)
             self.printer.add_object('probe',
                                     probe.PrinterProbe(config, adxl345_endstop))
-    def connect(self):
+    def is_initialized(self):
+        return (self.read_reg(REG_DATA_FORMAT) & 0xB) != 0
+    def initialize(self):
         # Setup ADXL345 parameters and verify chip connectivity
         self.set_reg(REG_POWER_CTL, 0x00)
         dev_id = self.read_reg(REG_DEVID)
         if dev_id != 0xe5:
-            raise self.printer.config_error("Invalid adxl345 id (got %x vs %x)"
-                                            % (dev_id, 0xe5))
+            raise self.printer.command_error("Invalid adxl345 id (got %x vs %x)"
+                                             % (dev_id, 0xe5))
         self.set_reg(REG_INT_ENABLE, 0x00)
         self.set_reg(REG_DATA_FORMAT, 0x0B)
     def get_mcu(self):
@@ -304,7 +373,7 @@ class ADXL345:
         response = bytearray(params['response'])
         return response[1]
     def set_reg(self, reg, val, minclock=0):
-        self.spi.spi_send([reg, val], minclock=minclock)
+        self.spi.spi_send([reg, val & 0xFF], minclock=minclock)
         stored_val = self.read_reg(reg)
         if stored_val != val:
             raise self.printer.command_error(
@@ -315,7 +384,11 @@ class ADXL345:
     def is_measuring(self):
         return self.query_rate > 0
     def start_measurements(self, rate=None):
+        if self.is_measuring():
+            return
         rate = rate or self.data_rate
+        if not self.is_initialized():
+            self.initialize()
         # Setup chip in requested query rate
         clock = 0
         if self.last_tx_time:
