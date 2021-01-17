@@ -1439,6 +1439,9 @@ cs_pin:
 #samples_result:
 #samples_tolerance:
 #samples_tolerance_retries:
+#z_endstop_probe_point:
+#horizontal_move_z:
+#horizontal_move_speed:
 #   See the "probe" section for information on these parameters.
 ```
 
@@ -1562,6 +1565,16 @@ z_offset:
 #   triggers. This parameter must be provided.
 #speed: 5.0
 #   Speed (in mm/s) of the Z axis when probing. The default is 5mm/s.
+#z_endstop_probe_point:
+#    X,Y coordinates of the point where the z endstop position can be
+#    tested. If set, this is where Z_ENDSTOP_CALIBRATE command will
+#    run an automatic test to adjust z endstop position.
+#horizontal_move_z: 5
+#   The height (in mm) that the head should be commanded to move to
+#   just prior to starting a probe operation. The default is 5.
+#horizontal_move_speed: 50
+#   The speed (in mm/s) of non-probing moves during the Z endstop
+#   calibration. The default is 50.
 #samples: 1
 #   The number of times to probe each point. The probed z-values will
 #   be averaged. The default is to probe 1 time.
