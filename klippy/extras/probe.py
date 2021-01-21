@@ -46,29 +46,6 @@ class PrinterProbe:
                                                  minval=0.)
         self.samples_retries = config.getint('samples_tolerance_retries', 0,
                                              minval=0)
-        # Register Z_ENDSTOP_CALIBRATE command
-        zconfig = config.getsection('stepper_z')
-        self.z_position_endstop = zconfig.getfloat('position_endstop', None,
-                                                   note_valid=False)
-        if self.z_position_endstop is not None:
-            self.z_endstop_probe_point = None
-            if config.get('z_endstop_probe_point', None) is not None:
-                try:
-                    self.z_endstop_probe_point = [
-                            float(coord.strip()) for coord in
-                            config.get('z_endstop_probe_point').split(',', 1)]
-                except:
-                    raise config.error(
-                            "Unable to parse z_endstop_probe_point '%s'" % (
-                                config.get('z_endstop_probe_point')))
-                self.horizontal_move_z = config.getfloat(
-                        'horizontal_move_z', 5.)
-                self.horizontal_move_speed = config.getfloat(
-                        'horizontal_move_speed', 50., above=0.)
-            gcode = self.printer.lookup_object('gcode')
-            gcode.register_command(
-                'Z_ENDSTOP_CALIBRATE', self.cmd_Z_ENDSTOP_CALIBRATE,
-                desc=self.cmd_Z_ENDSTOP_CALIBRATE_help)
         # Register z_virtual_endstop pin
         self.printer.lookup_object('pins').register_chip('probe', self)
         # Register homing event handlers
@@ -286,39 +263,6 @@ class PrinterProbe:
         # Start manual probe
         manual_probe.ManualProbeHelper(self.printer, gcmd,
                                        self.probe_calibrate_finalize)
-    def z_endstop_finalize(self, pos):
-        if pos is None:
-            return
-        z_pos = self.z_position_endstop - pos[2]
-        self.gcode.respond_info(
-            "stepper_z: position_endstop: %.3f\n"
-            "The SAVE_CONFIG command will update the printer config file\n"
-            "with the above and restart the printer." % (z_pos,))
-        configfile = self.printer.lookup_object('configfile')
-        configfile.set('stepper_z', 'position_endstop', "%.3f" % (z_pos,))
-    cmd_Z_ENDSTOP_CALIBRATE_help = "Calibrate a Z endstop (e.g. using a probe)"
-    def cmd_Z_ENDSTOP_CALIBRATE(self, gcmd):
-        manual_probe.verify_no_manual_probe(self.printer)
-        method = gcmd.get('METHOD', 'automatic').lower()
-        if method != 'automatic':
-            manual_probe.ManualProbeHelper(
-                    self.printer, gcmd, self.z_endstop_finalize)
-            return
-        lift_speed = self.get_lift_speed(gcmd)
-        toolhead = self.printer.lookup_object('toolhead')
-        oldpos = toolhead.get_position()
-        if self.z_endstop_probe_point is not None:
-            self._move([None, None, self.horizontal_move_z], lift_speed)
-            self._move(self.z_endstop_probe_point + [None],
-                       self.horizontal_move_speed)
-        curpos = self.run_probe(gcmd)
-        offset_pos = [0., 0., curpos[2] - self.z_offset]
-        if self.z_endstop_probe_point is not None:
-            curpos[2] = self.horizontal_move_z
-        else:
-            curpos[2] = oldpos[2]
-        self._move(curpos, lift_speed)
-        self.z_endstop_finalize(offset_pos)
 
 # Endstop wrapper that enables probe specific features
 class ProbeEndstopWrapper:

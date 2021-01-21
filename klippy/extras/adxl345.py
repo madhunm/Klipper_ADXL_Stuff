@@ -4,7 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging, math, time, collections, multiprocessing, os
-from . import bus, probe
+from . import bus, manual_probe, probe
 
 # ADXL345 registers
 REG_DEVID = 0x00
@@ -108,6 +108,64 @@ class ADXL345Results:
         write_proc.daemon = True
         write_proc.start()
 
+class BedOffsetHelper:
+    def __init__(self, config):
+        self.printer = config.get_printer()
+        # Register BED_OFFSET_CALIBRATE command
+        zconfig = config.getsection('stepper_z')
+        self.z_position_endstop = zconfig.getfloat('position_endstop', None,
+                                                   note_valid=False)
+        if self.z_position_endstop is None:
+            return
+        self.bed_probe_point = None
+        if config.get('bed_probe_point', None) is not None:
+            try:
+                self.bed_probe_point = [
+                        float(coord.strip()) for coord in
+                        config.get('bed_probe_point').split(',', 1)]
+            except:
+                raise config.error(
+                        "Unable to parse bed_probe_point '%s'" % (
+                            config.get('bed_probe_point')))
+            self.horizontal_move_z = config.getfloat(
+                    'horizontal_move_z', 5.)
+            self.horizontal_move_speed = config.getfloat(
+                    'horizontal_move_speed', 50., above=0.)
+        gcode = self.printer.lookup_object('gcode')
+        gcode.register_command(
+            'BED_OFFSET_CALIBRATE', self.cmd_BED_OFFSET_CALIBRATE,
+            desc=self.cmd_BED_OFFSET_CALIBRATE_help)
+    def bed_offset_finalize(self, pos, gcmd):
+        if pos is None:
+            return
+        z_pos = self.z_position_endstop - pos[2]
+        gcmd.respond_info(
+            "stepper_z: position_endstop: %.3f\n"
+            "The SAVE_CONFIG command will update the printer config file\n"
+            "with the above and restart the printer." % (z_pos,))
+        configfile = self.printer.lookup_object('configfile')
+        configfile.set('stepper_z', 'position_endstop', "%.3f" % (z_pos,))
+    cmd_BED_OFFSET_CALIBRATE_help = "Calibrate a bed offset using ADXL345 probe"
+    def cmd_BED_OFFSET_CALIBRATE(self, gcmd):
+        manual_probe.verify_no_manual_probe(self.printer)
+        probe = self.printer.lookup_object('probe')
+        lift_speed = probe.get_lift_speed(gcmd)
+        toolhead = self.printer.lookup_object('toolhead')
+        oldpos = toolhead.get_position()
+        if self.bed_probe_point is not None:
+            toolhead.manual_move([None, None, self.horizontal_move_z],
+                                 lift_speed)
+            toolhead.manual_move(self.bed_probe_point + [None],
+                                 self.horizontal_move_speed)
+        curpos = probe.run_probe(gcmd)
+        offset_pos = [0., 0., curpos[2] - probe.get_offsets()[2]]
+        if self.bed_probe_point is not None:
+            curpos[2] = self.horizontal_move_z
+        else:
+            curpos[2] = oldpos[2]
+        toolhead.manual_move(curpos, lift_speed)
+        self.bed_offset_finalize(offset_pos, gcmd)
+
 # ADXL345 virtual endstop wrapper for probing
 class ADXL345EndstopWrapper:
     def __init__(self, config, adxl345, axes_map):
@@ -152,6 +210,8 @@ class ADXL345EndstopWrapper:
                 "ACCEL_PROBE_CALIBRATE", "CHIP", None,
                 self.cmd_ACCELPROBE_CALIBRATE,
                 desc=self.cmd_ACCELPROBE_CALIBRATE_help)
+        # Register bed offset calibration helper
+        BedOffsetHelper(config)
     def _build_config(self):
         kin = self.printer.lookup_object('toolhead').get_kinematics()
         for stepper in kin.get_steppers():
