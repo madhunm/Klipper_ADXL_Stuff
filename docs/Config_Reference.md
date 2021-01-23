@@ -1432,6 +1432,10 @@ cs_pin:
 #   The maximum duration of a 'tap' during probing. If the acceleration
 #   exceeds tap_thresh for at most tap_dur during probing, this will
 #   trigger the probe endstop. The default is 0.01 sec.
+#bed_probe_point:
+#   X, Y coordinates of a point to test the bed offset. Used by
+#   `BED_OFFSET_CALIBRATE` command. The nozzle height prior to
+#   probing can be set via `horizontal_move_z` parameter.
 #z_offset:
 #speed:
 #samples:
@@ -1439,7 +1443,6 @@ cs_pin:
 #samples_result:
 #samples_tolerance:
 #samples_tolerance_retries:
-#z_endstop_probe_point:
 #horizontal_move_z:
 #horizontal_move_speed:
 #   See the "probe" section for information on these parameters.
