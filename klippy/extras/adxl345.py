@@ -364,10 +364,10 @@ class ADXL345:
         gcode.register_mux_command("ACCELEROMETER_QUERY", "CHIP", self.name,
                                    self.cmd_ACCELEROMETER_QUERY,
                                    desc=self.cmd_ACCELEROMETER_QUERY_help)
-        gcode.register_mux_command("READ_ADXL345", "CHIP", name,
+        gcode.register_mux_command("READ_ADXL345", "CHIP", self.name,
                                    self.cmd_READ_ADXL345,
                                    desc=self.cmd_READ_ADXL345_help)
-        gcode.register_mux_command("SET_ADXL345", "CHIP", name,
+        gcode.register_mux_command("SET_ADXL345", "CHIP", self.name,
                                    self.cmd_SET_ADXL345,
                                    desc=self.cmd_SET_ADXL345_help)
         if self.name == "default":
