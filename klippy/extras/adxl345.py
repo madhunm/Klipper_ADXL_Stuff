@@ -36,6 +36,7 @@ TAP_SCALE = 0.0625 * FREEFALL_ACCEL # 62.5mg/LSB * Earth gravity in mm/s**2
 OFS_SCALE = 0.0156 * FREEFALL_ACCEL # 15.6mg/LSB * Earth gravity in mm/s**2
 
 PROBE_CALIBRATION_TIME = 1.
+ADXL345_REST_TIME = .01
 
 Accel_Measurement = collections.namedtuple(
     'Accel_Measurement', ('time', 'accel_x', 'accel_y', 'accel_z'))
@@ -295,21 +296,24 @@ class ADXL345EndstopWrapper:
                     "retry with ACCEL_PROBE_CALIBRATE command")
         adxl345 = self.adxl345
         toolhead = self.printer.lookup_object('toolhead')
-        print_time = toolhead.get_last_move_time()
         toolhead.flush_step_generation()
-        clock = self.adxl345.get_mcu().print_time_to_clock(print_time)
+        print_time = toolhead.get_last_move_time()
+        clock = self.adxl345.get_mcu().print_time_to_clock(print_time +
+                                                           ADXL345_REST_TIME)
         if not adxl345.is_initialized():
             adxl345.initialize()
+        adxl345.set_reg(REG_INT_ENABLE, 0x00, minclock=clock)
         adxl345.read_reg(REG_INT_SOURCE)
         adxl345.set_reg(REG_INT_ENABLE, 0x40, minclock=clock)
         if not adxl345.is_measuring():
-            adxl345.set_reg(REG_POWER_CTL, 0x08)
+            adxl345.set_reg(REG_POWER_CTL, 0x08, minclock=clock)
         if not self._try_clear_tap():
             raise self.printer.command_error(
                     "ADXL345 tap triggered before move, too sensitive?")
     def probe_finish(self):
         adxl345 = self.adxl345
         toolhead = self.printer.lookup_object('toolhead')
+        toolhead.dwell(ADXL345_REST_TIME)
         print_time = toolhead.get_last_move_time()
         clock = adxl345.get_mcu().print_time_to_clock(print_time)
         adxl345.set_reg(REG_INT_ENABLE, 0x00, minclock=clock)
