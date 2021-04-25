@@ -1561,6 +1561,10 @@ stepper_z config section.
 [probe]
 pin:
 #   Probe detection pin. This parameter must be provided.
+#deactivate_on_each_sample: True
+#   This determines if Klipper should execute deactivation gcode
+#   between each probe attempt when performing a multiple probe
+#   sequence. The default is True.
 #x_offset: 0.0
 #   The distance (in mm) between the probe and the nozzle along the
 #   x-axis. The default is 0.
@@ -3954,12 +3958,14 @@ for your print to begin.
 [palette2]
 serial:
 #   The serial port to connect to the Palette 2.
-#baud: 250000
-#   The baud rate to use. The default is 250000.
+#baud: 115200
+#   The baud rate to use. The default is 115200.
 #feedrate_splice: 0.8
 #   The feedrate to use when splicing, default is 0.8
 #feedrate_normal: 1.0
 #   The feedrate to use after splicing, default is 1.0
 #auto_load_speed: 2
 #   Extrude feedrate when autoloading, default is 2 (mm/s)
+#auto_cancel_variation: 0.1
+#   Auto cancel print when ping varation is above this threshold
 ```

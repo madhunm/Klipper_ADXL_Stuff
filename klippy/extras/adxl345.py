@@ -29,6 +29,8 @@ QUERY_RATES = {
     800: 0xd, 1600: 0xe, 3200: 0xf,
 }
 
+ADXL345_DEV_ID = 0xe5
+
 FREEFALL_ACCEL = 9.80665 * 1000.
 SCALE = 0.0039 * FREEFALL_ACCEL # 3.9mg/LSB * Earth gravity in mm/s**2
 DUR_SCALE = 0.000625 # 0.625 msec / LSB
@@ -368,37 +370,39 @@ class ADXL345:
         gcode.register_mux_command("ACCELEROMETER_QUERY", "CHIP", self.name,
                                    self.cmd_ACCELEROMETER_QUERY,
                                    desc=self.cmd_ACCELEROMETER_QUERY_help)
-        gcode.register_mux_command("READ_ADXL345", "CHIP", self.name,
-                                   self.cmd_READ_ADXL345,
-                                   desc=self.cmd_READ_ADXL345_help)
-        gcode.register_mux_command("SET_ADXL345", "CHIP", self.name,
-                                   self.cmd_SET_ADXL345,
-                                   desc=self.cmd_SET_ADXL345_help)
+        gcode.register_mux_command("ADXL345_DEBUG_READ", "CHIP", self.name,
+                                   self.cmd_ADXL345_DEBUG_READ,
+                                   desc=self.cmd_ADXL345_DEBUG_READ_help)
+        gcode.register_mux_command("ADXL345_DEBUG_WRITE", "CHIP", self.name,
+                                   self.cmd_ADXL345_DEBUG_WRITE,
+                                   desc=self.cmd_ADXL345_DEBUG_WRITE_help)
         if self.name == "default":
             gcode.register_mux_command("ACCELEROMETER_MEASURE", "CHIP", None,
                                        self.cmd_ACCELEROMETER_MEASURE)
             gcode.register_mux_command("ACCELEROMETER_QUERY", "CHIP", None,
                                        self.cmd_ACCELEROMETER_QUERY)
-            gcode.register_mux_command("READ_ADXL345", "CHIP", None,
-                                       self.cmd_READ_ADXL345,
-                                       desc=self.cmd_READ_ADXL345_help)
-            gcode.register_mux_command("SET_ADXL345", "CHIP", None,
-                                       self.cmd_SET_ADXL345,
-                                       desc=self.cmd_SET_ADXL345_help)
+            gcode.register_mux_command("ADXL345_DEBUG_READ", "CHIP", None,
+                                       self.cmd_ADXL345_DEBUG_READ,
+                                       desc=self.cmd_ADXL345_DEBUG_READ_help)
+            gcode.register_mux_command("ADXL345_DEBUG_WRITE", "CHIP", None,
+                                       self.cmd_ADXL345_DEBUG_WRITE,
+                                       desc=self.cmd_ADXL345_DEBUG_WRITE_help)
         if config.get('probe_pin', None) is not None:
             adxl345_endstop = ADXL345EndstopWrapper(config, self, self.axes_map)
             self.printer.add_object('probe',
                                     probe.PrinterProbe(config, adxl345_endstop))
     def is_initialized(self):
-        return (self.read_reg(REG_DATA_FORMAT) & 0xB) != 0
+        # In case of miswiring, testing ADXL345 device ID prevents treating
+        # noise or wrong signal as a correctly initialized device
+        return (self.read_reg(REG_DEVID) == ADXL345_DEV_ID and
+                (self.read_reg(REG_DATA_FORMAT) & 0xB) != 0)
     def initialize(self):
         # Setup ADXL345 parameters and verify chip connectivity
         self.set_reg(REG_POWER_CTL, 0x00)
         dev_id = self.read_reg(REG_DEVID)
-        if dev_id != 0xe5:
+        if dev_id != ADXL345_DEV_ID:
             raise self.printer.command_error("Invalid adxl345 id (got %x vs %x)"
-                                             % (dev_id, 0xe5))
-        self.set_reg(REG_INT_ENABLE, 0x00)
+                                             % (dev_id, ADXL345_DEV_ID))
         self.set_reg(REG_DATA_FORMAT, 0x0B)
     def get_mcu(self):
         return self.spi.get_mcu()
@@ -541,16 +545,15 @@ class ADXL345:
         _, accel_x, accel_y, accel_z = values[-1]
         gcmd.respond_info("adxl345 values (x, y, z): %.6f, %.6f, %.6f" % (
             accel_x, accel_y, accel_z))
-    cmd_READ_ADXL345_help = "Query accelerometer register"
-    def cmd_READ_ADXL345(self, gcmd):
+    cmd_ADXL345_DEBUG_READ_help = "Query accelerometer register (for debugging)"
+    def cmd_ADXL345_DEBUG_READ(self, gcmd):
         if self.is_measuring():
             raise gcmd.error("adxl345 measurements in progress")
         reg = gcmd.get("REG", minval=29, maxval=57, parser=lambda x: int(x, 0))
         val = self.read_reg(reg)
         gcmd.respond_info("ADXL345 REG[0x%x] = 0x%x" % (reg, val))
-
-    cmd_SET_ADXL345_help = "Set accelerometer register"
-    def cmd_SET_ADXL345(self, gcmd):
+    cmd_ADXL345_DEBUG_WRITE_help = "Set accelerometer register (for debugging)"
+    def cmd_ADXL345_DEBUG_WRITE(self, gcmd):
         if self.is_measuring():
             raise gcmd.error("adxl345 measurements in progress")
         reg = gcmd.get("REG", minval=29, maxval=57, parser=lambda x: int(x, 0))
