@@ -211,8 +211,11 @@ class ADXL345EndstopWrapper:
         gcode = self.printer.lookup_object('gcode')
         gcode.register_mux_command(
                 "ACCEL_PROBE_CALIBRATE", "CHIP", None,
-                self.cmd_ACCELPROBE_CALIBRATE,
-                desc=self.cmd_ACCELPROBE_CALIBRATE_help)
+                self.cmd_ACCEL_PROBE_CALIBRATE,
+                desc=self.cmd_ACCEL_PROBE_CALIBRATE_help)
+        gcode.register_mux_command(
+                "SET_ACCEL_PROBE", "CHIP", None, self.cmd_SET_ACCEL_PROBE,
+                desc=self.cmd_SET_ACCEL_PROBE_help)
         # Register bed offset calibration helper
         BedOffsetHelper(config)
     def _build_config(self):
@@ -324,9 +327,17 @@ class ADXL345EndstopWrapper:
         if not self._try_clear_tap():
             raise self.printer.command_error(
                     "ADXL345 tap triggered after move, too sensitive?")
-    cmd_ACCELPROBE_CALIBRATE_help = "Force ADXL345 probe [re-]calibration"
-    def cmd_ACCELPROBE_CALIBRATE(self, gcmd):
+    cmd_ACCEL_PROBE_CALIBRATE_help = "Force ADXL345 probe [re-]calibration"
+    def cmd_ACCEL_PROBE_CALIBRATE(self, gcmd):
         self.calibrate(gcmd)
+    cmd_SET_ACCEL_PROBE_help = "Configure ADXL345 parameters related to probing"
+    def cmd_SET_ACCEL_PROBE(self, gcmd):
+        self.tap_thresh = gcmd.get_float('TAP_THRESH', self.tap_thresh,
+                                         minval=TAP_SCALE, maxval=100000.)
+        self.tap_dur = config.getfloat('TAP_DUR', self.tap_dur,
+                                       above=DUR_SCALE, maxval=0.1)
+        adxl345.set_reg(REG_THRESH_TAP, int(self.tap_thresh / TAP_SCALE))
+        adxl345.set_reg(REG_DUR, int(self.tap_dur / DUR_SCALE))
 
 # Printer class that controls ADXL345 chip
 class ADXL345:
