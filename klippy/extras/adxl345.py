@@ -294,7 +294,7 @@ class ADXL345EndstopWrapper:
                 return True
             tries -= 1
         return False
-    def probe_prepare(self):
+    def probe_prepare(self, hmove):
         if not self.calibrated:
             raise self.printer.command_error(
                     "ADXL345 probe failed calibration, "
@@ -315,7 +315,7 @@ class ADXL345EndstopWrapper:
         if not self._try_clear_tap():
             raise self.printer.command_error(
                     "ADXL345 tap triggered before move, too sensitive?")
-    def probe_finish(self):
+    def probe_finish(self, hmove):
         adxl345 = self.adxl345
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.dwell(ADXL345_REST_TIME)
